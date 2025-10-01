@@ -1,0 +1,7 @@
+gradio>=4.3.0
+pandas
+matplotlib
+seaborn
+scikit-learn
+pillow
+groq
