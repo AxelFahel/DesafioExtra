@@ -11,14 +11,18 @@ from groq import Groq
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from scipy.stats import zscore
 
-# Usar variável de ambiente segura para a chave
-GROQ_API_KEY = os.environ.get("API_KEY_GROQ", "")
+REMOVE_OUTLIERS = True
+STANDARDIZE_DATA = True
 
 state = {
-    "df": None,
+    "df_raw": None,
+    "df_processed": None,
     "client": None,
 }
+
+GROQ_API_KEY = os.environ.get("API_KEY_GROQ", "")
 
 def init_groq():
     if not GROQ_API_KEY:
@@ -42,17 +46,31 @@ def load_file(file):
                     df = pd.read_csv(f)
         else:
             df = pd.read_csv(file.name)
-        state["df"] = df
-        return "✅ Arquivo carregado com sucesso."
+        state["df_raw"] = df
+        df_cleaned = preprocess_data(df)
+        state["df_processed"] = df_cleaned
+        return "✅ Arquivo carregado e pré-processado com sucesso."
     except Exception as e:
         return f"❌ Erro ao ler arquivo: {str(e)}"
+
+def preprocess_data(df):
+    df_clean = df.copy()
+    num_cols = df_clean.select_dtypes(include=np.number).columns
+    if REMOVE_OUTLIERS:
+        z_scores = np.abs(zscore(df_clean[num_cols], nan_policy='omit'))
+        filter_mask = (z_scores < 3).all(axis=1)
+        df_clean = df_clean.loc[filter_mask]
+    if STANDARDIZE_DATA:
+        scaler = StandardScaler()
+        df_clean[num_cols] = scaler.fit_transform(df_clean[num_cols])
+    return df_clean
 
 def sanitize_text(text):
     nfkd_form = unicodedata.normalize('NFKD', text)
     return nfkd_form.encode('ASCII', 'ignore').decode('ASCII')
 
 def create_prompt(question):
-    df = state["df"]
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
     cols_info = "\n".join([f"- {col} ({str(dtype)})" for col, dtype in zip(df.columns, df.dtypes)])
     sample = df.head(5).to_string()
     stats = df.describe(include='all').to_string()
@@ -62,23 +80,67 @@ def create_prompt(question):
               f"Estatísticas:\n{stats}\n\nPergunta: {question}\n")
     return sanitize_text(prompt)
 
-def detect_tasks(question):
-    df = state["df"]
-    q = question.lower()
-    # Colunas citadas
-    cols = [col for col in df.columns if col.lower() in q]
-    # Termos autônomos para funções
-    wants_plots = any(t in q for t in ["distribuicao", "distribuição", "histograma", "histogram", "grafico", "gráfico", "plot", "frequencia", "visualizacao", "visualização"])
-    wants_scatter = any(t in q for t in ["scatter", "dispersao", "dispersão"])
-    wants_heatmap = any(t in q for t in ["heatmap", "correlacao", "correlação", "matriz"])
-    wants_cluster = any(t in q for t in ["cluster", "clusters", "clusterizacao", "k-means", "pca", "agrupamento"])
-    if wants_plots and not cols:
+def analyze_frequency_and_outliers(df):
+    text_summary = ""
+    imgs = []
+
+    for col in df.columns:
+        if df[col].dtype == 'object' or len(df[col].unique()) < 20:
+            counts = df[col].value_counts()
+            most_freq = counts.idxmax()
+            least_freq = counts.idxmin()
+            text_summary += f"Coluna {col}: valor mais frequente '{most_freq}' com {counts[most_freq]} ocorrências; menos frequente '{least_freq}' com {counts[least_freq]} ocorrências.\n"
+
+            fig, ax = plt.subplots(figsize=(6,3))
+            sns.barplot(x=counts.index, y=counts.values, ax=ax)
+            ax.set_title(f'Frequência variável {col}')
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            img = Image.open(buf)
+            imgs.append(np.array(img))
+        else:
+            text_summary += f"Coluna {col}: variável contínua.\n"
+            fig, ax = plt.subplots(figsize=(6,3))
+            sns.boxplot(x=df[col], ax=ax)
+            ax.set_title(f'Boxplot variável {col}')
+            plt.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png')
+            plt.close(fig)
+            buf.seek(0)
+            img = Image.open(buf)
+            imgs.append(np.array(img))
+    return text_summary, imgs
+
+def detect_cols_and_tasks(question):
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
+    lower_q = question.lower()
+    cols_mentioned = [col for col in df.columns if col.lower() in lower_q]
+
+    graphic_terms = ["distribuicao", "distribuição", "histograma", "histogram", "grafico", "gráfico", "plot", "frequencia", "visualizacao", "visualização"]
+    scatter_terms = ["scatter", "dispersao", "dispersão"]
+    heatmap_terms = ["heatmap", "correlacao", "correlação", "matriz"]
+    cluster_terms = ["cluster", "clusters", "clusterizacao", "clusterização", "k-means", "pca", "agrupamento"]
+    freq_terms = ["frequente", "frequência", "pouco frequente", "valor mais comum", "valor menos comum", "outlier", "valores extremos", "boxplot"]
+
+    wants_plots = any(term in lower_q for term in graphic_terms)
+    wants_scatter = any(term in lower_q for term in scatter_terms)
+    wants_heatmap = any(term in lower_q for term in heatmap_terms)
+    wants_cluster = any(term in lower_q for term in cluster_terms)
+    wants_freq_analysis = any(term in lower_q for term in freq_terms)
+
+    if wants_plots and not cols_mentioned:
         num_cols = list(df.select_dtypes(include=np.number).columns)
-        cols = num_cols[:5]
-    return cols, wants_scatter, wants_heatmap, wants_cluster
+        cols_mentioned = num_cols[:5]
+
+    return cols_mentioned, wants_scatter, wants_heatmap, wants_cluster, wants_freq_analysis
 
 def generate_distribution_plots(cols):
-    df = state["df"]
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
     imgs = []
     for col in cols:
         if col not in df.columns:
@@ -100,7 +162,7 @@ def generate_distribution_plots(cols):
     return imgs
 
 def generate_scatter_plot():
-    df = state["df"]
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
     num_cols = list(df.select_dtypes(include=np.number).columns)
     imgs = []
     for i in range(min(len(num_cols)-1, 3)):
@@ -118,7 +180,7 @@ def generate_scatter_plot():
     return imgs
 
 def generate_correlation_heatmap():
-    df = state["df"]
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
     num_cols = list(df.select_dtypes(include=np.number).columns)
     if not num_cols:
         return []
@@ -135,7 +197,7 @@ def generate_correlation_heatmap():
     return [np.array(img)]
 
 def generate_cluster_plot():
-    df = state["df"]
+    df = state["df_processed"] if state["df_processed"] is not None else state["df_raw"]
     num_cols = list(df.select_dtypes(include=np.number).columns)
     if len(num_cols) < 2:
         return []
@@ -164,11 +226,12 @@ def ask_groq(question):
     client = state["client"]
     if client is None:
         client = init_groq()
+        state["client"] = client
         if client is None:
             return "❌ API Groq não configurada.", []
-    if state["df"] is None:
+    if state["df_raw"] is None:
         return "❌ Nenhum arquivo carregado.", []
-    cols, wants_scatter, wants_heatmap, wants_cluster = detect_tasks(question)
+    cols, wants_scatter, wants_heatmap, wants_cluster, wants_freq = detect_cols_and_tasks(question)
     prompt = create_prompt(question)
     messages = [
         {"role": "system", "content": "Voce e um analista de dados muito detalhado."},
@@ -183,6 +246,10 @@ def ask_groq(question):
         )
         text = response.choices[0].message.content
         imgs = []
+        if wants_freq:
+            freq_text, freq_imgs = analyze_frequency_and_outliers(state["df_processed"] if state["df_processed"] is not None else state["df_raw"])
+            text += "\n\n" + freq_text
+            imgs += freq_imgs
         if cols:
             imgs += generate_distribution_plots(cols)
         if wants_scatter:
@@ -203,11 +270,11 @@ def process(file, question):
 
 demo = gr.Blocks()
 with demo:
-    gr.Markdown("# 🤖 Agente Autonomo Genérico para Análise de Dados com Groq")
+    gr.Markdown("# 🤖 Agente Autônomo Inteligente para Análise de Dados")
     with gr.Row():
         with gr.Column(scale=1):
             file_in = gr.File(label="Upload CSV/ZIP", file_types=['.csv','.zip'])
-            question_in = gr.Textbox(label="Faça sua pergunta", placeholder="Ex: Analisar distribuições, scatter plot, heatmap ou cluster")
+            question_in = gr.Textbox(label="Faça sua pergunta", placeholder="Ex: Analisar distribuições, frequência, outliers, scatter plot, heatmap ou cluster")
             btn = gr.Button("Analisar e Responder")
         with gr.Column(scale=2):
             answer_out = gr.Markdown(label="Resposta do Agente")
