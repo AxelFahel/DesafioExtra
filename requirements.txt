@@ -1,7 +1,9 @@
-gradio>=4.3.0
+gradio
 pandas
+numpy
 matplotlib
 seaborn
 scikit-learn
 pillow
 groq
+scipy
